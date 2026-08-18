@@ -7,8 +7,10 @@ from datetime import datetime
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response as XMLResponse
+from twilio.twiml.voice_response import Gather, VoiceResponse
 
 from pydantic import BaseModel
 from schemas import ChatRequest, ChatMessage, BayStatus, AgentStatus, ShopConfig, MechanicIntent
@@ -16,6 +18,7 @@ from parts_agent import lookup_parts
 from billing import calculate_billing
 from browser_agent import run_browser_checkout
 from chat_agent import process_chat_message
+import twilio_agent as tw
 
 load_dotenv()
 
@@ -380,9 +383,14 @@ async def text_to_speech(req: dict):
     return Response(content=resp.content, media_type="audio/mpeg")
 
 
-@app.post("/api/chat")
-async def chat(req: ChatRequest):
-    bay_id = req.bay_number
+async def handle_chat_turn(bay_id: str, message: str) -> dict:
+    """Core conversational pipeline: text in, agent reasoning + action execution, reply out.
+
+    Shared by the web chat endpoint (/api/chat) and the Twilio phone-call
+    endpoints (/twilio/gather). A browser chat message and a transcribed
+    phone utterance both reduce to "this bay_id said this" — so both entry
+    points run through this exact same logic rather than duplicating it.
+    """
     if bay_id not in bays:
         bays[bay_id] = BayStatus(bay_number=bay_id)
 
@@ -390,11 +398,11 @@ async def chat(req: ChatRequest):
     now = datetime.now().isoformat()
 
     # Add user message to history
-    bay.chat_history.append(ChatMessage(role="user", content=req.message, timestamp=now))
+    bay.chat_history.append(ChatMessage(role="user", content=message, timestamp=now))
 
     # Call the conversational agent
     try:
-        result = await process_chat_message(bay, req.message)
+        result = await process_chat_message(bay, message)
     except Exception as e:
         reply = f"Sorry, something went wrong: {str(e)}"
         bay.chat_history.append(ChatMessage(role="assistant", content=reply, timestamp=now))
@@ -552,6 +560,111 @@ async def chat(req: ChatRequest):
         "billing": billing_out,
         "parts_results": parts_out,
     }
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest):
+    return await handle_chat_turn(req.bay_number, req.message)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Twilio phone integration
+#
+# A phone call is just another way for a mechanic to talk to BayOps — so
+# each call gets its own bay in the same `bays` dict (keyed by Twilio's
+# CallSid), and every turn is routed through the same handle_chat_turn()
+# pipeline the web chat uses. Twilio does the speech-to-text for us via
+# <Gather input="speech">; we generate the spoken reply with the same
+# ElevenLabs voice /api/tts already uses, and hand Twilio a URL to fetch it.
+# ─────────────────────────────────────────────────────────────────────────
+
+def _call_bay_id(form: dict) -> str:
+    return f"call-{form.get('CallSid', 'unknown')}"
+
+
+def _speech_gather(action: str = "/twilio/gather") -> Gather:
+    return Gather(
+        input="speech",
+        action=action,
+        method="POST",
+        speech_timeout="auto",
+        speech_model="phone_call",
+    )
+
+
+@app.post("/twilio/voice")
+async def twilio_voice(request: Request):
+    """Twilio hits this the moment someone calls the shop's BayOps number."""
+    form = dict(await request.form())
+    if not tw.validate_twilio_request(request, form):
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    bay_id = _call_bay_id(form)
+    bays.setdefault(bay_id, BayStatus(bay_number=bay_id))
+
+    vr = VoiceResponse()
+    gather = _speech_gather()
+    await tw.say(gather, tw.GREETING)
+    vr.append(gather)
+    # Caller said nothing before the Gather timed out — try once more.
+    vr.redirect("/twilio/voice")
+    return XMLResponse(content=str(vr), media_type="application/xml")
+
+
+@app.post("/twilio/gather")
+async def twilio_gather(request: Request):
+    """Twilio hits this with the transcribed SpeechResult after each utterance."""
+    form = dict(await request.form())
+    if not tw.validate_twilio_request(request, form):
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    bay_id = _call_bay_id(form)
+    speech_text = form.get("SpeechResult", "").strip()
+
+    vr = VoiceResponse()
+
+    if not speech_text:
+        gather = _speech_gather()
+        await tw.say(gather, tw.NO_INPUT)
+        vr.append(gather)
+        vr.redirect("/twilio/voice")
+        return XMLResponse(content=str(vr), media_type="application/xml")
+
+    result = await handle_chat_turn(bay_id, speech_text)
+    reply_text = result.get("reply") or "Sorry, could you say that again?"
+
+    gather = _speech_gather()
+    await tw.say(gather, reply_text)
+    vr.append(gather)
+    # If they hang up mid-Gather this never fires; if they just go quiet,
+    # loop back to the greeting rather than dead-ending the call.
+    vr.redirect("/twilio/voice")
+    return XMLResponse(content=str(vr), media_type="application/xml")
+
+
+@app.post("/twilio/status")
+async def twilio_status(request: Request):
+    """Optional call-state callback (ringing, completed, etc.) — set this as
+    the phone number's 'Call Status Changes' webhook in the Twilio console
+    to log call end in the bay's activity log."""
+    form = dict(await request.form())
+    bay_id = _call_bay_id(form)
+    call_status = form.get("CallStatus", "")
+    if bay_id in bays:
+        bays[bay_id].logs.append(f"Call {call_status}")
+        await manager.broadcast({"type": "agent_log", "bay": bay_id, "message": f"Call {call_status}"})
+    return XMLResponse(status_code=204)
+
+
+@app.get("/twilio/audio/{token}.mp3")
+async def twilio_audio(token: str):
+    """Twilio's <Play> verb fetches this with a plain GET — it can't receive
+    audio bytes inline in the TwiML response, so generated clips are cached
+    here briefly by tw.say() and served back out by token."""
+    data = tw.get_cached_audio(token)
+    if not data:
+        raise HTTPException(status_code=404, detail="Audio expired or not found")
+    return XMLResponse(content=data, media_type="audio/mpeg")
 
 
 @app.get("/api/bays")
