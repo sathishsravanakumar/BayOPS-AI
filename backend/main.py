@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import sys
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -201,15 +200,8 @@ async def execute_intent(intent: MechanicIntent, bay_id: str) -> dict:
 
 
 def start_browser_thread(intent, search_results, bay_id):
+    import sys
     def _run():
-        # Playwright launches its browser driver as a subprocess, which on
-        # Windows REQUIRES ProactorEventLoop — SelectorEventLoop cannot
-        # spawn subprocesses at all there (asyncio raises NotImplementedError).
-        # Windows normally defaults to Proactor, but things like uvicorn's
-        # --reload/WatchFiles reloader are known to leave a thread on
-        # Selector instead. Setting the policy explicitly here, right
-        # before creating this thread's event loop, makes it correct
-        # regardless of whatever the ambient policy happens to be.
         if sys.platform == "win32":
             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
         loop = asyncio.new_event_loop()
@@ -564,7 +556,7 @@ async def handle_chat_turn(bay_id: str, message: str) -> dict:
                 has_parts = any(i.item_type == "PART" for i in intent.items)
                 if has_parts and search_results.get("results"):
                     if bay.pending_browser_intent:
-                        reply += " Fitment check flagged an issue — see the warning above."
+                        reply += " Heads up — I flagged a possible fitment concern on that part. Just say 'go ahead anyway' if you want me to add it to cart."
                     else:
                         start_browser_thread(intent, search_results, bay_id)
                         reply += " Opening AutoZone to add to cart..."
@@ -638,7 +630,7 @@ async def _respond_to_job(job_id: str) -> VoiceResponse:
     instead of leaving the caller in silence or risking a Twilio webhook
     timeout, we hand back a short natural "hold on" line plus a redirect
     to /twilio/poll, while the real work keeps running in the background."""
-    result = await tw.wait_for_job(job_id, timeout=3.0)
+    result = await tw.wait_for_job(job_id, timeout=8.0)
     vr = VoiceResponse()
 
     if result is None:
