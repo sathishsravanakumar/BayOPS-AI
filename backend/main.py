@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sys
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -13,7 +14,7 @@ from fastapi.responses import Response as XMLResponse
 from twilio.twiml.voice_response import Gather, VoiceResponse
 
 from pydantic import BaseModel
-from schemas import ChatRequest, ChatMessage, BayStatus, AgentStatus, ShopConfig, MechanicIntent
+from schemas import ChatRequest, ChatMessage, BayStatus, AgentStatus, ShopConfig, MechanicIntent, Vehicle
 from parts_agent import lookup_parts
 from billing import calculate_billing
 from browser_agent import run_browser_checkout
@@ -201,6 +202,16 @@ async def execute_intent(intent: MechanicIntent, bay_id: str) -> dict:
 
 def start_browser_thread(intent, search_results, bay_id):
     def _run():
+        # Playwright launches its browser driver as a subprocess, which on
+        # Windows REQUIRES ProactorEventLoop — SelectorEventLoop cannot
+        # spawn subprocesses at all there (asyncio raises NotImplementedError).
+        # Windows normally defaults to Proactor, but things like uvicorn's
+        # --reload/WatchFiles reloader are known to leave a thread on
+        # Selector instead. Setting the policy explicitly here, right
+        # before creating this thread's event loop, makes it correct
+        # regardless of whatever the ambient policy happens to be.
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -412,6 +423,31 @@ async def handle_chat_turn(bay_id: str, message: str) -> dict:
     reply = result.get("reply", "")
     response_type = result.get("response_type", "message")
     action_data = result.get("action_data")
+
+    # Persist whatever the model has confidently extracted so far — on
+    # EVERY turn, regardless of response_type — instead of only at the
+    # final "action" turn. This is what fixes state loss over a noisy
+    # phone call: build_bay_context() below reads from bay.technician_name /
+    # bay.vehicle, so those need to reflect reality turn-by-turn, not just
+    # once everything's been collected. Never overwrites a known value with
+    # a blank one — only fills in new information.
+    collected = result.get("collected") or {}
+    new_name = (collected.get("technician_name") or "").strip()
+    if new_name:
+        bay.technician_name = new_name
+
+    veh_in = collected.get("vehicle") or {}
+    new_year = (veh_in.get("year") or "").strip()
+    new_make = (veh_in.get("make") or "").strip()
+    new_model = (veh_in.get("model") or "").strip()
+    if new_year or new_make or new_model:
+        current = bay.vehicle
+        bay.vehicle = Vehicle(
+            year=new_year or (current.year if current else ""),
+            make=new_make or (current.make if current else ""),
+            model=new_model or (current.model if current else ""),
+            vin=current.vin if current else None,
+        )
 
     billing_out = None
     parts_out = None

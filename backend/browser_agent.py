@@ -2,6 +2,7 @@ import asyncio
 import base64
 import os
 import re
+import sys
 import threading
 from typing import Callable, Awaitable
 
@@ -20,6 +21,9 @@ def _close_browser_sync(bay_id: str):
     if not entry:
         return
     pw, browser = entry
+    # See start_browser_thread() in main.py for why this matters on Windows.
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     loop = asyncio.new_event_loop()
     try:
         async def _do():
