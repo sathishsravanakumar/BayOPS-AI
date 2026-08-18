@@ -132,7 +132,7 @@ async def _groq_fitment_check(vehicle: Vehicle, vehicle_details: dict, parts: li
         )
 
         response = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content": _FITMENT_SYSTEM},
                 {"role": "user", "content": user_msg},

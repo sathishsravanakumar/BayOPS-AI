@@ -404,7 +404,8 @@ async def handle_chat_turn(bay_id: str, message: str) -> dict:
     try:
         result = await process_chat_message(bay, message)
     except Exception as e:
-        reply = f"Sorry, something went wrong: {str(e)}"
+        print(f"[handle_chat_turn] agent error for bay {bay_id}: {e}")
+        reply = "Sorry, I hit a snag on my end — could you say that one more time?"
         bay.chat_history.append(ChatMessage(role="assistant", content=reply, timestamp=now))
         return {"reply": reply, "response_type": "message", "billing": None, "parts_results": None}
 
@@ -536,7 +537,8 @@ async def handle_chat_turn(bay_id: str, message: str) -> dict:
             bay.status = AgentStatus.COMPLETE
 
         except Exception as e:
-            reply += f" (Error: {str(e)[:80]})"
+            print(f"[handle_chat_turn] action error for bay {bay_id} ({action_type}): {e}")
+            reply += " Hmm, something didn't go through on that — want me to try again?"
             bay.status = AgentStatus.ERROR
 
     # Add assistant reply to history
@@ -582,14 +584,51 @@ def _call_bay_id(form: dict) -> str:
     return f"call-{form.get('CallSid', 'unknown')}"
 
 
-def _speech_gather(action: str = "/twilio/gather") -> Gather:
+def _speech_gather() -> Gather:
     return Gather(
         input="speech",
-        action=action,
+        action=tw.absolute_url("/twilio/gather"),
         method="POST",
         speech_timeout="auto",
         speech_model="phone_call",
+        hints=tw.SPEECH_HINTS,
     )
+
+
+async def _respond_to_job(job_id: str) -> VoiceResponse:
+    """Waits briefly for a chat turn to finish. Quick turns (asking for a
+    missing field, confirming something) resolve well within this window and
+    the caller never notices. Slow turns (parts search, checkout) don't — so
+    instead of leaving the caller in silence or risking a Twilio webhook
+    timeout, we hand back a short natural "hold on" line plus a redirect
+    to /twilio/poll, while the real work keeps running in the background."""
+    result = await tw.wait_for_job(job_id, timeout=3.0)
+    vr = VoiceResponse()
+
+    if result is None:
+        if not tw.job_is_known(job_id):
+            # Job genuinely vanished (server restart mid-call, or a stale/
+            # invalid id) — recover with a normal question instead of
+            # looping a "still working" message on a job that doesn't exist.
+            gather = _speech_gather()
+            await tw.say(gather, "Sorry, I lost track of that — could you say that again?")
+            vr.append(gather)
+            vr.redirect(tw.absolute_url("/twilio/voice"))
+            return vr
+
+        await tw.say(vr, tw.next_hold_message(job_id))
+        vr.pause(length=1)
+        vr.redirect(tw.absolute_url(f"/twilio/poll?job={job_id}"), method="POST")
+        return vr
+
+    reply_text = result.get("reply") or "Sorry, could you say that again?"
+    gather = _speech_gather()
+    await tw.say(gather, reply_text)
+    vr.append(gather)
+    # If they hang up mid-Gather this never fires; if they just go quiet,
+    # loop back to the greeting rather than dead-ending the call.
+    vr.redirect(tw.absolute_url("/twilio/voice"))
+    return vr
 
 
 @app.post("/twilio/voice")
@@ -607,7 +646,7 @@ async def twilio_voice(request: Request):
     await tw.say(gather, tw.GREETING)
     vr.append(gather)
     # Caller said nothing before the Gather timed out — try once more.
-    vr.redirect("/twilio/voice")
+    vr.redirect(tw.absolute_url("/twilio/voice"))
     return XMLResponse(content=str(vr), media_type="application/xml")
 
 
@@ -621,24 +660,28 @@ async def twilio_gather(request: Request):
     bay_id = _call_bay_id(form)
     speech_text = form.get("SpeechResult", "").strip()
 
-    vr = VoiceResponse()
-
     if not speech_text:
+        vr = VoiceResponse()
         gather = _speech_gather()
         await tw.say(gather, tw.NO_INPUT)
         vr.append(gather)
-        vr.redirect("/twilio/voice")
+        vr.redirect(tw.absolute_url("/twilio/voice"))
         return XMLResponse(content=str(vr), media_type="application/xml")
 
-    result = await handle_chat_turn(bay_id, speech_text)
-    reply_text = result.get("reply") or "Sorry, could you say that again?"
+    job_id = tw.start_job(handle_chat_turn(bay_id, speech_text))
+    vr = await _respond_to_job(job_id)
+    return XMLResponse(content=str(vr), media_type="application/xml")
 
-    gather = _speech_gather()
-    await tw.say(gather, reply_text)
-    vr.append(gather)
-    # If they hang up mid-Gather this never fires; if they just go quiet,
-    # loop back to the greeting rather than dead-ending the call.
-    vr.redirect("/twilio/voice")
+
+@app.post("/twilio/poll")
+async def twilio_poll(request: Request, job: str):
+    """Twilio redirects here in a short loop while a slow chat turn (parts
+    search, checkout) is still finishing in the background."""
+    form = dict(await request.form())
+    if not tw.validate_twilio_request(request, form):
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    vr = await _respond_to_job(job)
     return XMLResponse(content=str(vr), media_type="application/xml")
 
 

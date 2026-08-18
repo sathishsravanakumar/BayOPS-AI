@@ -131,7 +131,7 @@ async def extract_all_vendors(
     try:
         client = _get_groq_client()
         response = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content": EXTRACT_PROMPT},
                 {"role": "user", "content": user_msg},

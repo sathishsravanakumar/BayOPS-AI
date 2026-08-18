@@ -1,5 +1,6 @@
 import json
 import os
+import re  # noqa: F401 — used in _extract_json below
 from groq import AsyncGroq
 from schemas import ChatMessage, BayStatus
 
@@ -36,6 +37,13 @@ Other rules:
 - If user says "yes", "go ahead", "do it" — that's confirmation to proceed
 - For labor: extract hours. Ask if not specified.
 - Always be helpful and conversational
+
+VOICE AND TONE — this gets read aloud on a phone call, so it has to sound like a person, not a script:
+- Talk like a real, busy-but-friendly service advisor, not a chatbot. Use contractions: "I'll", "that's", "you're", "let's".
+- Vary your acknowledgments — don't say "Got it" every single turn. Mix in things like "Sounds good", "Perfect", "Alright", "No problem", "Sure thing".
+- Never use bullet points, numbered lists, dashes, asterisks, or any text formatting. Say everything as plain spoken sentences — a list read aloud sounds broken.
+- Never say internal terms like "action_data", field names, error codes, or anything that sounds like you're reading from a database. If something failed, say so plainly and naturally ("I couldn't find that — mind trying again?"), never repeat a raw error message.
+- If you only caught part of what they said, ask a short, natural clarifying question instead of guessing.
 
 You MUST respond with ONLY valid JSON:
 {
@@ -126,13 +134,26 @@ async def process_chat_message(
     messages.append({"role": "user", "content": user_message})
 
     response = await client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         messages=messages,
         temperature=0.3,
-        response_format={"type": "json_object"},
     )
 
-    parsed = json.loads(response.choices[0].message.content)
+    raw = response.choices[0].message.content or ""
+
+    # Model may wrap JSON in markdown fences or add prose around it.
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group())
+            except json.JSONDecodeError:
+                parsed = {}
+        else:
+            # Model returned plain text — treat it as a conversational reply.
+            parsed = {"response_type": "message", "reply": raw.strip()}
 
     if "response_type" not in parsed:
         parsed["response_type"] = "message"
